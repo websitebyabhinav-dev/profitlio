@@ -20,7 +20,9 @@ from telegram.ext import (
 # -------------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------------
-BOT_TOKEN = "8560262173:AAHf2FqcR6R5ti8HUi3Htv2S-zv-EXD00r0"
+# NEW
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 ADMIN_ID = 7662143324
 MAILTM_API = "https://api.mail.tm"
 DB_FILE = "tempmail.db"
