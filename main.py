@@ -8,25 +8,30 @@ import string
 import time
 import requests
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 # -------------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------------
-# NEW
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 ADMIN_ID = 7662143324
 MAILTM_API = "https://api.mail.tm"
 DB_FILE = "tempmail.db"
-CYCLE_12H = 12 * 3600  # 12 Hours in seconds
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO
@@ -55,12 +60,13 @@ def init_db():
         )
         c.execute(
             """CREATE TABLE IF NOT EXISTS active_emails (
-                user_id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
                 email TEXT NOT NULL,
                 token TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                seen_ids TEXT NOT NULL
+                seen_ids TEXT NOT NULL,
+                is_current INTEGER DEFAULT 1
             )"""
         )
         c.execute(
@@ -86,26 +92,33 @@ def touch_user(user_id: int):
         conn.commit()
 
 
-def get_active_email(user_id: int):
+def get_current_email(user_id: int):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT * FROM active_emails WHERE user_id = ?", (user_id,))
+        c.execute(
+            "SELECT * FROM active_emails WHERE user_id = ? AND is_current = 1 ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
         row = c.fetchone()
         return dict(row) if row else None
 
 
-def save_active_email(user_id: int, email: str, token: str, expires_at: int):
+def get_user_emails(user_id: int):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM active_emails WHERE user_id = ? ORDER BY id DESC", (user_id,))
+        return [dict(r) for r in c.fetchall()]
+
+
+def save_active_email(user_id: int, email: str, token: str):
     now = int(time.time())
     with get_db() as conn:
         c = conn.cursor()
+        c.execute("UPDATE active_emails SET is_current = 0 WHERE user_id = ?", (user_id,))
         c.execute(
-            """INSERT INTO active_emails (user_id, email, token, created_at, expires_at, seen_ids)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET
-                   email=excluded.email, token=excluded.token,
-                   created_at=excluded.created_at, expires_at=excluded.expires_at,
-                   seen_ids=excluded.seen_ids""",
-            (user_id, email, token, now, expires_at, json.dumps([])),
+            """INSERT INTO active_emails (user_id, email, token, created_at, seen_ids, is_current)
+               VALUES (?, ?, ?, ?, ?, 1)""",
+            (user_id, email, token, now, json.dumps([])),
         )
         c.execute(
             "INSERT INTO email_history (user_id, email, created_at) VALUES (?, ?, ?)",
@@ -114,12 +127,20 @@ def save_active_email(user_id: int, email: str, token: str, expires_at: int):
         conn.commit()
 
 
-def update_seen_ids(user_id: int, seen_ids: list):
+def set_current_email_by_id(user_id: int, email_id: int):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE active_emails SET is_current = 0 WHERE user_id = ?", (user_id,))
+        c.execute("UPDATE active_emails SET is_current = 1 WHERE id = ? AND user_id = ?", (email_id, user_id))
+        conn.commit()
+
+
+def update_seen_ids(email_db_id: int, seen_ids: list):
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
-            "UPDATE active_emails SET seen_ids = ? WHERE user_id = ?",
-            (json.dumps(seen_ids), user_id),
+            "UPDATE active_emails SET seen_ids = ? WHERE id = ?",
+            (json.dumps(seen_ids), email_db_id),
         )
         conn.commit()
 
@@ -227,7 +248,7 @@ def get_msg_detail(msg_id: str, token: str):
 
 
 # -------------------------------------------------------------------
-# HEALTH CHECK SERVER (UPTIMEROBOT)
+# HEALTH CHECK SERVER
 # -------------------------------------------------------------------
 async def handle_health(request):
     return web.Response(text="OK - Temp Mail Bot Online", status=200)
@@ -246,46 +267,21 @@ async def start_health_server():
 
 
 # -------------------------------------------------------------------
-# BACKGROUND POLLER & 12H ROTATOR
+# BACKGROUND POLLER
 # -------------------------------------------------------------------
 async def background_worker(app: Application):
-    logger.info("⚡ Background Poller & Rotator active.")
+    logger.info("⚡ Background Poller active.")
     while True:
         try:
             records = get_all_active_emails()
-            now = int(time.time())
 
             for rec in records:
+                db_id = rec["id"]
                 uid = rec["user_id"]
                 token = rec["token"]
-                expires_at = rec["expires_at"]
+                email_addr = rec["email"]
                 seen_ids = json.loads(rec["seen_ids"])
 
-                # 12-Hour Rotation Check
-                if now >= expires_at:
-                    n_email, n_token = create_mailtm_acc()
-                    if n_email and n_token:
-                        save_active_email(uid, n_email, n_token, now + CYCLE_12H)
-                        msg = (
-                            "🔄 **12-Hour Mail Rotated!**\n\n"
-                            f"📧 **New Mail:** `{n_email}`\n"
-                            "⏳ **Valid:** 12 Hours (2 Mails / Day)"
-                        )
-                        kbd = InlineKeyboardMarkup(
-                            [[InlineKeyboardButton("📥 Refresh Inbox", callback_data="check_inbox")]]
-                        )
-                        try:
-                            await app.bot.send_message(
-                                chat_id=uid,
-                                text=msg,
-                                parse_mode="Markdown",
-                                reply_markup=kbd,
-                            )
-                        except Exception:
-                            pass
-                    continue
-
-                # Poll Inbox
                 msgs = get_inbox(token)
                 new_found = False
                 for m in msgs:
@@ -302,26 +298,23 @@ async def background_worker(app: Application):
 
                             mail_text = (
                                 "📩 **NEW MAIL RECEIVED**\n\n"
+                                f"🎯 **For:** `{email_addr}`\n"
                                 f"👤 **From:** `{sender}`\n"
                                 f"📌 **Subject:** {subj}\n"
                                 f"📅 **Date:** {date}\n\n"
                                 f"💬 **Message:**\n{body[:1500]}"
-                            )
-                            kbd = InlineKeyboardMarkup(
-                                [[InlineKeyboardButton("📥 Refresh Inbox", callback_data="check_inbox")]]
                             )
                             try:
                                 await app.bot.send_message(
                                     chat_id=uid,
                                     text=mail_text,
                                     parse_mode="Markdown",
-                                    reply_markup=kbd,
                                 )
                             except Exception as e:
                                 logger.error(f"Send mail to {uid} failed: {e}")
 
                 if new_found:
-                    update_seen_ids(uid, seen_ids)
+                    update_seen_ids(db_id, seen_ids)
 
         except Exception as e:
             logger.error(f"Poller Error: {e}")
@@ -330,54 +323,132 @@ async def background_worker(app: Application):
 
 
 # -------------------------------------------------------------------
-# HELPER & TELEGRAM HANDLERS
+# KEYBOARD MARKUP HELPER
 # -------------------------------------------------------------------
-def get_time_left(expires_at: int) -> str:
-    rem = expires_at - int(time.time())
-    if rem <= 0:
-        return "0h 0m"
-    return f"{rem // 3600}h {(rem % 3600) // 60}m"
+def get_custom_keyboard(uid: int):
+    # Stacks each button vertically like the screenshot
+    keyboard = [
+        [KeyboardButton("📥 Refresh Inbox")],
+        [KeyboardButton("🆕 Generate New Mail")],
+        [KeyboardButton("📜 My Mail History")]
+    ]
+    if uid == ADMIN_ID:
+        keyboard.append([KeyboardButton("📊 Admin Dashboard")])
+        
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+# -------------------------------------------------------------------
+# HANDLERS
+# -------------------------------------------------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     touch_user(uid)
 
-    rec = get_active_email(uid)
-    now = int(time.time())
+    rec = get_current_email(uid)
 
-    if not rec or now >= rec["expires_at"]:
+    if not rec:
         email, token = create_mailtm_acc()
         if not email or not token:
             await update.message.reply_text("❌ Failed to allocate email. Try again.")
             return
-        save_active_email(uid, email, token, now + CYCLE_12H)
-        rec = get_active_email(uid)
+        save_active_email(uid, email, token)
+        rec = get_current_email(uid)
 
-    t_left = get_time_left(rec["expires_at"])
     txt = (
-        "⚡ **Temp Mail Active**\n\n"
-        f"📧 **Your Mail:** `{rec['email']}`\n"
-        f"⏳ **Expires In:** `{t_left}`\n"
-        "🔄 **Schedule:** 2 Mails / 24 Hours"
+        "⚡ **Unlimited Temp Mail Active**\n\n"
+        f"📧 **Active Mail:** `{rec['email']}`\n"
+        "✨ **Limit:** Unlimited Mails Available!"
     )
-
-    btns = [
-        [InlineKeyboardButton("📥 Refresh Inbox", callback_data="check_inbox")],
-        [InlineKeyboardButton("👤 My Status", callback_data="my_status")],
-    ]
-    if uid == ADMIN_ID:
-        btns.append([InlineKeyboardButton("📊 Admin Dashboard", callback_data="admin_stats")])
 
     await update.message.reply_text(
-        txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns)
+        txt, parse_mode="Markdown", reply_markup=get_custom_keyboard(uid)
     )
+
+
+async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    uid = update.effective_user.id
+    touch_user(uid)
+
+    if text == "📥 Refresh Inbox":
+        rec = get_current_email(uid)
+        if not rec:
+            await update.message.reply_text("❌ No active email found!")
+            return
+        msgs = get_inbox(rec["token"])
+        if not msgs:
+            await update.message.reply_text("📥 Inbox empty. No emails yet!")
+        else:
+            await update.message.reply_text(f"🔔 {len(msgs)} email(s) found in inbox!")
+
+    elif text == "🆕 Generate New Mail":
+        email, token = create_mailtm_acc()
+        if not email or not token:
+            await update.message.reply_text("❌ Error creating mail. Try again later.")
+            return
+        save_active_email(uid, email, token)
+        txt = (
+            "✨ **New Mail Generated!**\n\n"
+            f"📧 **Active Mail:** `{email}`"
+        )
+        await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=get_custom_keyboard(uid))
+
+    elif text == "📜 My Mail History":
+        emails = get_user_emails(uid)
+        if not emails:
+            await update.message.reply_text("No emails found.")
+            return
+
+        txt = "📜 **Your Mails (Select to Switch):**\n\n"
+        kbd = []
+        for item in emails[:10]:
+            mark = "✅ " if item["is_current"] else "📧 "
+            txt += f"{mark}`{item['email']}`\n"
+            kbd.append([InlineKeyboardButton(f"Switch to {item['email'][:15]}...", callback_data=f"switch_{item['id']}")])
+
+        await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kbd))
+
+    elif text == "📊 Admin Dashboard":
+        if uid != ADMIN_ID:
+            return
+        tot_u, d_u, m_u, act_m, tot_m = get_stats()
+        txt = (
+            "📊 **ADMIN DASHBOARD**\n\n"
+            f"👥 **Total Users:** `{tot_u}`\n"
+            f"🔥 **24H Active:** `{d_u}`\n"
+            f"📅 **30D Monthly:** `{m_u}`\n"
+            f"⚡ **Active Mails:** `{act_m}`\n"
+            f"📧 **Total Generated:** `{tot_m}`"
+        )
+        await update.message.reply_text(txt, parse_mode="Markdown")
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = query.from_user.id
+    touch_user(uid)
+
+    try:
+        if query.data.startswith("switch_"):
+            email_id = int(query.data.split("_")[1])
+            set_current_email_by_id(uid, email_id)
+            rec = get_current_email(uid)
+            txt = (
+                "🔄 **Switched Active Email!**\n\n"
+                f"📧 **Active Mail:** `{rec['email']}`"
+            )
+            await query.edit_message_text(txt, parse_mode="Markdown")
+
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            logger.error(f"BadRequest: {e}")
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid != ADMIN_ID:
-        return  # Admin Only Silent Block
+        return
 
     tot_u, d_u, m_u, act_m, tot_m = get_stats()
     txt = (
@@ -394,7 +465,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid != ADMIN_ID:
-        return  # Admin Only Protection
+        return
 
     msg_text = " ".join(context.args)
     if not msg_text:
@@ -415,7 +486,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=u, text=f"📢 **ANNOUNCEMENT**\n\n{msg_text}", parse_mode="Markdown"
             )
             sent += 1
-            await asyncio.sleep(0.05)  # Telegram Rate Limit Safety
+            await asyncio.sleep(0.05)
         except TelegramError:
             failed += 1
 
@@ -425,64 +496,6 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ **Failed/Blocked:** `{failed}`",
         parse_mode="Markdown",
     )
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = query.from_user.id
-    touch_user(uid)
-
-    try:
-        if query.data == "check_inbox":
-            rec = get_active_email(uid)
-            if not rec:
-                await query.answer("❌ No active email found!", show_alert=True)
-                return
-            msgs = get_inbox(rec["token"])
-            if not msgs:
-                await query.answer("📥 Inbox empty. No emails yet!", show_alert=False)
-            else:
-                await query.answer(f"🔔 {len(msgs)} email(s) found in inbox!", show_alert=True)
-
-        elif query.data == "my_status":
-            rec = get_active_email(uid)
-            if not rec:
-                await query.answer("❌ Active session expired.", show_alert=True)
-                return
-            t_left = get_time_left(rec["expires_at"])
-            txt = (
-                "👤 **USER STATUS**\n\n"
-                f"🆔 **User ID:** `{uid}`\n"
-                f"📧 **Mail:** `{rec['email']}`\n"
-                f"⏳ **Next Rotation:** `{t_left}`\n"
-                "⚙️ **Quota:** 2 Mails / 24 Hours"
-            )
-            kbd = [
-                [InlineKeyboardButton("📥 Refresh Inbox", callback_data="check_inbox")]
-            ]
-            if uid == ADMIN_ID:
-                kbd.append([InlineKeyboardButton("📊 Admin Dashboard", callback_data="admin_stats")])
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kbd))
-
-        elif query.data == "admin_stats":
-            if uid != ADMIN_ID:
-                await query.answer("⛔ Access Denied! Admin Only.", show_alert=True)
-                return
-            tot_u, d_u, m_u, act_m, tot_m = get_stats()
-            txt = (
-                "📊 **ADMIN DASHBOARD**\n\n"
-                f"👥 **Total Users:** `{tot_u}`\n"
-                f"🔥 **24H Active:** `{d_u}`\n"
-                f"📅 **30D Monthly:** `{m_u}`\n"
-                f"⚡ **Active Mails:** `{act_m}`\n"
-                f"📧 **Total Generated:** `{tot_m}`"
-            )
-            kbd = [[InlineKeyboardButton("⬅️ Back", callback_data="my_status")]]
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kbd))
-
-    except BadRequest as e:
-        if "Message is not modified" not in str(e):
-            logger.error(f"BadRequest: {e}")
 
 
 # -------------------------------------------------------------------
@@ -504,9 +517,13 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("new", handle_text_buttons))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("bc", broadcast_cmd))
+    
+    # Handle text inputs from the persistent keyboard
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("⚡ Bot initialized successfully!")
